@@ -10,7 +10,7 @@ const app = express();
 const server = http.createServer(app);
 const io = new Server(server, {
   cors: { origin: '*' },
-  maxHttpBufferSize: 50 * 1024 * 1024 // 50MB
+  maxHttpBufferSize: 50 * 1024 * 1024
 });
 
 const PORT = process.env.PORT || 3000;
@@ -33,11 +33,7 @@ const storage = multer.diskStorage({
 const fileFilter = (req, file, cb) => {
   const allowed = ['.mp3', '.wav', '.ogg', '.m4a', '.flac', '.aac', '.webm'];
   const ext = path.extname(file.originalname).toLowerCase();
-  if (allowed.includes(ext)) {
-    cb(null, true);
-  } else {
-    cb(new Error('Only audio files are allowed (.mp3, .wav, .ogg, .m4a, .flac, .aac, .webm)'));
-  }
+  cb(null, allowed.includes(ext));
 };
 
 const upload = multer({ storage, fileFilter, limits: { fileSize: 50 * 1024 * 1024 } });
@@ -48,123 +44,202 @@ app.use('/uploads', express.static(uploadsDir));
 
 // Upload endpoint
 app.post('/upload', upload.single('music'), (req, res) => {
-  if (!req.file) {
-    return res.status(400).json({ error: 'No file uploaded or invalid file type' });
-  }
-  const fileInfo = {
-    id: uuidv4(),
-    originalName: req.file.originalname,
-    filename: req.file.filename,
-    url: `/uploads/${req.file.filename}`,
-    size: req.file.size,
-    uploadedAt: new Date().toISOString()
-  };
-  res.json({ success: true, file: fileInfo });
+  if (!req.file) return res.status(400).json({ error: 'No file uploaded or invalid file type' });
+  res.json({
+    success: true,
+    file: {
+      id: uuidv4(),
+      originalName: req.file.originalname,
+      filename: req.file.filename,
+      url: `/uploads/${req.file.filename}`,
+      size: req.file.size,
+      uploadedAt: new Date().toISOString()
+    }
+  });
 });
 
 // List uploaded files
 app.get('/api/files', (req, res) => {
-  const files = fs.readdirSync(uploadsDir).filter(f => {
-    const ext = path.extname(f).toLowerCase();
-    return ['.mp3', '.wav', '.ogg', '.m4a', '.flac', '.aac', '.webm'].includes(ext);
-  }).map(f => {
-    const stat = fs.statSync(path.join(uploadsDir, f));
-    return {
-      filename: f,
-      originalName: f.replace(/^\d+-[a-f0-9]+-/, ''),
-      url: `/uploads/${f}`,
-      size: stat.size,
-      uploadedAt: stat.mtime.toISOString()
-    };
-  });
+  const allowed = ['.mp3', '.wav', '.ogg', '.m4a', '.flac', '.aac', '.webm'];
+  const files = fs.readdirSync(uploadsDir)
+    .filter(f => allowed.includes(path.extname(f).toLowerCase()))
+    .map(f => {
+      const stat = fs.statSync(path.join(uploadsDir, f));
+      return {
+        filename: f,
+        originalName: f.replace(/^\d+-[a-f0-9]+-/, ''),
+        url: `/uploads/${f}`,
+        size: stat.size,
+        uploadedAt: stat.mtime.toISOString()
+      };
+    });
   res.json(files);
 });
 
-// ── Socket.IO ──────────────────────────────────────────────
-const rooms = new Map(); // roomId -> { users: Map<socketId, {name, isHost}>, state: {...} }
+// ══════════════════════════════════════════════
+// SOCKET.IO — Room & Sync Engine
+// ══════════════════════════════════════════════
+
+// Room state is the single source of truth.
+// When music plays, we record the server timestamp of when
+// playback "would have started from 0" (playStartedAt).
+// This way any user can compute: currentTime = (now - playStartedAt) / 1000
+// and seek to the correct position immediately.
+
+const rooms = new Map();
+
+function getRoomState(roomId) {
+  if (!rooms.has(roomId)) {
+    rooms.set(roomId, {
+      users: new Map(),
+      state: {
+        type: null,       // 'file' or 'youtube'
+        src: null,
+        name: null,
+        playing: false,
+        currentTime: 0,
+        // Server timestamp (ms) representing when the track
+        // would have been at 0:00 if it played continuously.
+        playStartedAt: null,
+        pausedAt: 0        // the currentTime when paused
+      }
+    });
+  }
+  return rooms.get(roomId);
+}
+
+function computeCurrentTime(state) {
+  if (!state.playing || !state.playStartedAt) return state.pausedAt || 0;
+  return (Date.now() - state.playStartedAt) / 1000;
+}
+
+function userList(room) {
+  return Array.from(room.users.entries()).map(([id, u]) => ({ id, ...u }));
+}
 
 io.on('connection', (socket) => {
   console.log(`✓ Connected: ${socket.id}`);
 
+  // ── JOIN ────────────────────────────────
   socket.on('join-room', ({ roomId, userName }) => {
     socket.join(roomId);
-
-    if (!rooms.has(roomId)) {
-      rooms.set(roomId, {
-        users: new Map(),
-        state: {
-          type: null, // 'file' or 'youtube'
-          src: null,
-          playing: false,
-          currentTime: 0,
-          lastUpdate: Date.now()
-        }
-      });
-    }
-
-    const room = rooms.get(roomId);
+    const room = getRoomState(roomId);
     const isHost = room.users.size === 0;
     room.users.set(socket.id, { name: userName, isHost });
-
     socket.roomId = roomId;
     socket.userName = userName;
 
-    // Send current room state to the new user
+    // Send authoritative state with computed time
+    const st = { ...room.state, currentTime: computeCurrentTime(room.state), serverTime: Date.now() };
+
     socket.emit('room-joined', {
-      roomId,
-      isHost,
-      users: Array.from(room.users.entries()).map(([id, u]) => ({ id, ...u })),
-      state: room.state
+      roomId, isHost,
+      users: userList(room),
+      state: st
     });
 
-    // Notify others
     socket.to(roomId).emit('user-joined', {
-      id: socket.id,
-      name: userName,
-      isHost,
-      users: Array.from(room.users.entries()).map(([id, u]) => ({ id, ...u }))
+      id: socket.id, name: userName, isHost,
+      users: userList(room)
     });
 
-    console.log(`  → ${userName} joined room "${roomId}" (${isHost ? 'HOST' : 'guest'})`);
+    console.log(`  → ${userName} joined "${roomId}" (${isHost ? 'HOST' : 'guest'})`);
   });
 
-  // Play a local file
+  // ── PLAY FILE ──────────────────────────
   socket.on('play-file', ({ url, name }) => {
     const room = rooms.get(socket.roomId);
     if (!room) return;
-    room.state = { type: 'file', src: url, name, playing: true, currentTime: 0, lastUpdate: Date.now() };
-    io.to(socket.roomId).emit('track-changed', room.state);
+    room.state = {
+      type: 'file', src: url, name,
+      playing: true,
+      currentTime: 0,
+      playStartedAt: Date.now(),
+      pausedAt: 0
+    };
+    io.to(socket.roomId).emit('track-changed', {
+      ...room.state,
+      currentTime: 0,
+      serverTime: Date.now()
+    });
   });
 
-  // Play a YouTube URL
+  // ── PLAY YOUTUBE ───────────────────────
   socket.on('play-youtube', ({ videoId, title }) => {
     const room = rooms.get(socket.roomId);
     if (!room) return;
-    room.state = { type: 'youtube', src: videoId, name: title || 'YouTube Video', playing: true, currentTime: 0, lastUpdate: Date.now() };
-    io.to(socket.roomId).emit('track-changed', room.state);
+    room.state = {
+      type: 'youtube', src: videoId, name: title || 'YouTube Video',
+      playing: true,
+      currentTime: 0,
+      playStartedAt: Date.now(),
+      pausedAt: 0
+    };
+    io.to(socket.roomId).emit('track-changed', {
+      ...room.state,
+      currentTime: 0,
+      serverTime: Date.now()
+    });
   });
 
-  // Transport controls
+  // ── TRANSPORT (play/pause/seek) ────────
   socket.on('transport', ({ action, currentTime }) => {
     const room = rooms.get(socket.roomId);
     if (!room) return;
+    const st = room.state;
 
-    if (action === 'play') room.state.playing = true;
-    if (action === 'pause') room.state.playing = false;
-    if (currentTime !== undefined) room.state.currentTime = currentTime;
-    room.state.lastUpdate = Date.now();
+    if (action === 'play') {
+      // Resume from wherever we paused
+      st.playing = true;
+      st.playStartedAt = Date.now() - (st.pausedAt * 1000);
+      st.currentTime = st.pausedAt;
+    }
 
-    socket.to(socket.roomId).emit('transport', { action, currentTime, from: socket.userName });
+    if (action === 'pause') {
+      st.playing = false;
+      st.pausedAt = computeCurrentTime(st);
+      st.currentTime = st.pausedAt;
+      st.playStartedAt = null;
+    }
+
+    if (action === 'seek' && currentTime !== undefined) {
+      st.pausedAt = currentTime;
+      st.currentTime = currentTime;
+      if (st.playing) {
+        st.playStartedAt = Date.now() - (currentTime * 1000);
+      }
+    }
+
+    // Broadcast full state so every client can hard-sync
+    io.to(socket.roomId).emit('sync-state', {
+      ...st,
+      currentTime: computeCurrentTime(st),
+      serverTime: Date.now()
+    });
   });
 
-  // Sync request from late joiner
+  // ── SYNC REQUEST (late joiner / periodic) ──
   socket.on('sync-request', () => {
     const room = rooms.get(socket.roomId);
     if (!room) return;
-    socket.emit('sync-state', room.state);
+    socket.emit('sync-state', {
+      ...room.state,
+      currentTime: computeCurrentTime(room.state),
+      serverTime: Date.now()
+    });
   });
 
-  // Chat message
+  // ── HEARTBEAT — server pushes time to all in room ──
+  socket.on('heartbeat', () => {
+    const room = rooms.get(socket.roomId);
+    if (!room || !room.state.playing) return;
+    socket.emit('heartbeat-ack', {
+      currentTime: computeCurrentTime(room.state),
+      serverTime: Date.now()
+    });
+  });
+
+  // ── CHAT ────────────────────────────────
   socket.on('chat-message', ({ message }) => {
     io.to(socket.roomId).emit('chat-message', {
       from: socket.userName,
@@ -173,27 +248,26 @@ io.on('connection', (socket) => {
     });
   });
 
-  // Disconnect
+  // ── DISCONNECT ──────────────────────────
   socket.on('disconnect', () => {
     const roomId = socket.roomId;
     if (roomId && rooms.has(roomId)) {
       const room = rooms.get(roomId);
       room.users.delete(socket.id);
-
       if (room.users.size === 0) {
         rooms.delete(roomId);
         console.log(`  ✗ Room "${roomId}" deleted (empty)`);
       } else {
-        // If host left, assign new host
-        const firstUser = room.users.entries().next().value;
-        if (firstUser && !Array.from(room.users.values()).some(u => u.isHost)) {
-          firstUser[1].isHost = true;
-          io.to(firstUser[0]).emit('promoted-to-host');
+        if (!Array.from(room.users.values()).some(u => u.isHost)) {
+          const first = room.users.entries().next().value;
+          if (first) {
+            first[1].isHost = true;
+            io.to(first[0]).emit('promoted-to-host');
+          }
         }
         io.to(roomId).emit('user-left', {
-          id: socket.id,
-          name: socket.userName,
-          users: Array.from(room.users.entries()).map(([id, u]) => ({ id, ...u }))
+          id: socket.id, name: socket.userName,
+          users: userList(room)
         });
       }
     }

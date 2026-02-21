@@ -1,5 +1,6 @@
 /* ═══════════════════════════════════════════
    Multi Music Listener — Client Application
+   Enhanced sync: server-authoritative time
    ═══════════════════════════════════════════ */
 
 (function () {
@@ -14,13 +15,12 @@
   const roomNameDisplay = document.getElementById('room-name-display');
   const userCountEl = document.getElementById('user-count');
   const leaveBtn = document.getElementById('leave-btn');
+  const syncIndicator = document.getElementById('sync-indicator');
 
-  // YouTube
   const ytUrlInput = document.getElementById('yt-url-input');
   const ytPlayBtn = document.getElementById('yt-play-btn');
   const ytContainer = document.getElementById('yt-container');
 
-  // Upload
   const uploadArea = document.getElementById('upload-area');
   const fileInput = document.getElementById('file-input');
   const browseBtn = document.getElementById('browse-btn');
@@ -28,10 +28,8 @@
   const progressFill = document.getElementById('progress-fill');
   const uploadStatus = document.getElementById('upload-status');
 
-  // File list
   const fileListEl = document.getElementById('file-list');
 
-  // Player
   const audioPlayer = document.getElementById('audio-player');
   const playPauseBtn = document.getElementById('play-pause-btn');
   const prevBtn = document.getElementById('prev-btn');
@@ -46,7 +44,6 @@
   const timeTotal = document.getElementById('time-total');
   const volumeSlider = document.getElementById('volume-slider');
 
-  // Users & Chat
   const userListEl = document.getElementById('user-list');
   const chatMessages = document.getElementById('chat-messages');
   const chatInput = document.getElementById('chat-input');
@@ -59,11 +56,17 @@
   let isHost = false;
   let musicFiles = [];
   let currentFileIndex = -1;
-  let currentType = null; // 'file' or 'youtube'
+  let currentType = null;
   let ytPlayer = null;
   let ytReady = false;
   let isSeeking = false;
-  let ignoreTransport = false; // prevent echo
+  let suppressTransport = false;
+
+  // Sync tolerance: if drift > this many seconds, hard-seek to correct position
+  const SYNC_TOLERANCE = 0.8;
+  // How often (ms) the client asks the server for the authoritative time
+  const HEARTBEAT_INTERVAL = 3000;
+  let heartbeatTimer = null;
 
   // ─── Utility ──────────────────────────
   function formatTime(sec) {
@@ -92,7 +95,7 @@
   }
 
   const avatarColors = [
-    '#a855f7', '#06b6d4', '#f43f5e', '#10b981', '#f59e0b',
+    '#1db954', '#1ed760', '#f43f5e', '#10b981', '#f59e0b',
     '#3b82f6', '#ec4899', '#8b5cf6', '#14b8a6', '#ef4444'
   ];
 
@@ -104,7 +107,7 @@
 
   // ─── Join Room ────────────────────────
   joinBtn.addEventListener('click', joinRoom);
-  roomInput.addEventListener('keydown', e => { if (e.key === 'Enter') joinRoom(); });
+  roomInput.addEventListener('keydown', e => { if (e.key === 'Enter') nameInput.focus(); });
   nameInput.addEventListener('keydown', e => { if (e.key === 'Enter') joinRoom(); });
 
   function joinRoom() {
@@ -132,8 +135,8 @@
       addSystemChat('You are now the host!');
     });
     socket.on('track-changed', handleTrackChanged);
-    socket.on('transport', handleTransport);
     socket.on('sync-state', handleSyncState);
+    socket.on('heartbeat-ack', handleHeartbeat);
     socket.on('chat-message', handleChatMessage);
 
     joinScreen.classList.remove('active');
@@ -141,17 +144,78 @@
     roomNameDisplay.textContent = room;
 
     loadFileList();
+    startHeartbeat();
   }
 
   leaveBtn.addEventListener('click', () => {
+    stopHeartbeat();
     if (socket) socket.disconnect();
     appScreen.classList.remove('active');
     joinScreen.classList.add('active');
     audioPlayer.pause();
+    audioPlayer.src = '';
     if (ytPlayer && ytPlayer.stopVideo) ytPlayer.stopVideo();
     ytContainer.classList.add('hidden');
     resetNowPlaying();
+    currentType = null;
   });
+
+  // ─── Heartbeat (periodic sync check) ──
+  function startHeartbeat() {
+    stopHeartbeat();
+    heartbeatTimer = setInterval(() => {
+      if (socket && socket.connected) {
+        socket.emit('heartbeat');
+      }
+    }, HEARTBEAT_INTERVAL);
+  }
+
+  function stopHeartbeat() {
+    if (heartbeatTimer) { clearInterval(heartbeatTimer); heartbeatTimer = null; }
+  }
+
+  function handleHeartbeat({ currentTime, serverTime }) {
+    if (!currentType || isSeeking) return;
+    correctDrift(currentTime);
+  }
+
+  // Correct drift: if local playback is off by more than SYNC_TOLERANCE, hard-seek
+  function correctDrift(serverCurrentTime) {
+    if (isSeeking || suppressTransport) return;
+
+    let localTime = 0;
+    if (currentType === 'file') {
+      localTime = audioPlayer.currentTime || 0;
+    } else if (currentType === 'youtube' && ytPlayer && ytReady) {
+      localTime = ytPlayer.getCurrentTime() || 0;
+    } else {
+      return;
+    }
+
+    const drift = Math.abs(localTime - serverCurrentTime);
+
+    if (drift > SYNC_TOLERANCE) {
+      console.log(`[sync] Drift ${drift.toFixed(2)}s → correcting to ${serverCurrentTime.toFixed(2)}s`);
+      suppressTransport = true;
+
+      if (currentType === 'file') {
+        audioPlayer.currentTime = serverCurrentTime;
+      } else if (currentType === 'youtube' && ytPlayer && ytReady) {
+        ytPlayer.seekTo(serverCurrentTime, true);
+      }
+
+      setTimeout(() => { suppressTransport = false; }, 500);
+      showSyncIndicator();
+    }
+  }
+
+  function showSyncIndicator() {
+    syncIndicator.style.display = 'flex';
+    clearTimeout(syncIndicator._hideTimer);
+    syncIndicator._hideTimer = setTimeout(() => {
+      syncIndicator.style.display = 'none';
+    }, 3000);
+  }
 
   // ─── Room Events ──────────────────────
   function handleRoomJoined(data) {
@@ -191,22 +255,27 @@
   // ─── Track Changed ────────────────────
   function handleTrackChanged(state) {
     currentType = state.type;
+    suppressTransport = true;
 
     if (state.type === 'file') {
-      // Stop YouTube if playing
       if (ytPlayer && ytPlayer.stopVideo) ytPlayer.stopVideo();
       ytContainer.classList.add('hidden');
 
       audioPlayer.src = state.src;
       npTitle.textContent = state.name || 'Uploaded Track';
-      npSource.textContent = 'Local File';
+      npSource.textContent = '📁 Local File';
 
-      if (state.playing) {
-        audioPlayer.play().catch(() => {});
-        setPlayingUI(true);
-      }
+      audioPlayer.addEventListener('canplay', function onCanPlay() {
+        audioPlayer.removeEventListener('canplay', onCanPlay);
+        // Seek to server's authoritative time
+        audioPlayer.currentTime = state.currentTime || 0;
+        if (state.playing) {
+          audioPlayer.play().catch(() => {});
+          setPlayingUI(true);
+        }
+        setTimeout(() => { suppressTransport = false; }, 500);
+      });
 
-      // Highlight in file list
       highlightFile(state.src);
 
     } else if (state.type === 'youtube') {
@@ -214,34 +283,57 @@
       audioPlayer.src = '';
 
       npTitle.textContent = state.name || 'YouTube Video';
-      npSource.textContent = 'YouTube';
+      npSource.textContent = '▶ YouTube';
 
       ytContainer.classList.remove('hidden');
       loadYouTubeVideo(state.src, state.playing, state.currentTime || 0);
       setPlayingUI(state.playing);
-    }
-  }
-
-  function handleTransport({ action, currentTime }) {
-    ignoreTransport = true;
-
-    if (currentType === 'file') {
-      if (action === 'play') { audioPlayer.play().catch(() => {}); setPlayingUI(true); }
-      if (action === 'pause') { audioPlayer.pause(); setPlayingUI(false); }
-      if (action === 'seek' && currentTime !== undefined) audioPlayer.currentTime = currentTime;
-    } else if (currentType === 'youtube' && ytPlayer && ytReady) {
-      if (action === 'play') { ytPlayer.playVideo(); setPlayingUI(true); }
-      if (action === 'pause') { ytPlayer.pauseVideo(); setPlayingUI(false); }
-      if (action === 'seek' && currentTime !== undefined) ytPlayer.seekTo(currentTime, true);
+      setTimeout(() => { suppressTransport = false; }, 1000);
     }
 
-    setTimeout(() => { ignoreTransport = false; }, 300);
+    showSyncIndicator();
   }
 
+  // ─── Sync State (from server broadcast or heartbeat) ──
   function handleSyncState(state) {
-    if (state && state.src) {
+    if (!state || !state.src) return;
+
+    // If track changed, handle as new track
+    if (state.src !== getCurrentSrc()) {
       handleTrackChanged(state);
+      return;
     }
+
+    suppressTransport = true;
+
+    // Apply play/pause state
+    if (state.playing) {
+      if (currentType === 'file' && audioPlayer.paused) {
+        audioPlayer.play().catch(() => {});
+      } else if (currentType === 'youtube' && ytPlayer && ytReady) {
+        const ytState = ytPlayer.getPlayerState();
+        if (ytState !== YT.PlayerState.PLAYING) ytPlayer.playVideo();
+      }
+      setPlayingUI(true);
+    } else {
+      if (currentType === 'file' && !audioPlayer.paused) {
+        audioPlayer.pause();
+      } else if (currentType === 'youtube' && ytPlayer && ytReady) {
+        ytPlayer.pauseVideo();
+      }
+      setPlayingUI(false);
+    }
+
+    // Correct time position
+    correctDrift(state.currentTime);
+
+    setTimeout(() => { suppressTransport = false; }, 500);
+  }
+
+  function getCurrentSrc() {
+    if (currentType === 'file') return audioPlayer.src ? new URL(audioPlayer.src).pathname : null;
+    if (currentType === 'youtube') return ytPlayer ? ytPlayer.getVideoData?.()?.video_id : null;
+    return null;
   }
 
   // ─── Player Controls ─────────────────
@@ -249,22 +341,22 @@
     if (currentType === 'file') {
       if (audioPlayer.paused) {
         audioPlayer.play().catch(() => {});
-        socket.emit('transport', { action: 'play' });
+        socket.emit('transport', { action: 'play', currentTime: audioPlayer.currentTime });
         setPlayingUI(true);
       } else {
         audioPlayer.pause();
-        socket.emit('transport', { action: 'pause' });
+        socket.emit('transport', { action: 'pause', currentTime: audioPlayer.currentTime });
         setPlayingUI(false);
       }
     } else if (currentType === 'youtube' && ytPlayer && ytReady) {
-      const state = ytPlayer.getPlayerState();
-      if (state === YT.PlayerState.PLAYING) {
+      const st = ytPlayer.getPlayerState();
+      if (st === YT.PlayerState.PLAYING) {
         ytPlayer.pauseVideo();
-        socket.emit('transport', { action: 'pause' });
+        socket.emit('transport', { action: 'pause', currentTime: ytPlayer.getCurrentTime() });
         setPlayingUI(false);
       } else {
         ytPlayer.playVideo();
-        socket.emit('transport', { action: 'play' });
+        socket.emit('transport', { action: 'play', currentTime: ytPlayer.getCurrentTime() });
         setPlayingUI(true);
       }
     }
@@ -316,7 +408,6 @@
   });
 
   audioPlayer.addEventListener('ended', () => {
-    // Auto play next
     if (musicFiles.length > 1) {
       currentFileIndex = (currentFileIndex + 1) % musicFiles.length;
       const file = musicFiles[currentFileIndex];
@@ -326,20 +417,20 @@
     }
   });
 
-  // Seek bar interaction
+  // Seek bar
   seekBar.addEventListener('mousedown', startSeek);
   seekBar.addEventListener('touchstart', startSeek, { passive: true });
 
   function startSeek(e) {
     isSeeking = true;
-    updateSeek(e);
-    document.addEventListener('mousemove', updateSeek);
+    updateSeekUI(e);
+    document.addEventListener('mousemove', updateSeekUI);
     document.addEventListener('mouseup', endSeek);
-    document.addEventListener('touchmove', updateSeek, { passive: true });
+    document.addEventListener('touchmove', updateSeekUI, { passive: true });
     document.addEventListener('touchend', endSeek);
   }
 
-  function updateSeek(e) {
+  function updateSeekUI(e) {
     const rect = seekBar.getBoundingClientRect();
     const clientX = e.touches ? e.touches[0].clientX : e.clientX;
     let pct = ((clientX - rect.left) / rect.width) * 100;
@@ -350,15 +441,14 @@
 
   function endSeek(e) {
     isSeeking = false;
-    document.removeEventListener('mousemove', updateSeek);
+    document.removeEventListener('mousemove', updateSeekUI);
     document.removeEventListener('mouseup', endSeek);
-    document.removeEventListener('touchmove', updateSeek);
+    document.removeEventListener('touchmove', updateSeekUI);
     document.removeEventListener('touchend', endSeek);
 
     const rect = seekBar.getBoundingClientRect();
     const clientX = e.changedTouches ? e.changedTouches[0].clientX : e.clientX;
-    let pct = ((clientX - rect.left) / rect.width);
-    pct = Math.max(0, Math.min(1, pct));
+    let pct = Math.max(0, Math.min(1, (clientX - rect.left) / rect.width));
 
     if (currentType === 'file' && audioPlayer.duration) {
       const t = pct * audioPlayer.duration;
@@ -374,26 +464,24 @@
 
   // Volume
   volumeSlider.addEventListener('input', () => {
-    audioPlayer.volume = volumeSlider.value / 100;
+    const vol = volumeSlider.value / 100;
+    audioPlayer.volume = vol;
     if (ytPlayer && ytReady) ytPlayer.setVolume(volumeSlider.value);
   });
   audioPlayer.volume = 0.8;
 
   // ─── YouTube ──────────────────────────
-  // Load YT IFrame API
   const ytScript = document.createElement('script');
   ytScript.src = 'https://www.youtube.com/iframe_api';
   document.head.appendChild(ytScript);
 
-  window.onYouTubeIframeAPIReady = function () {
-    // API ready, player created on demand
-  };
+  window.onYouTubeIframeAPIReady = function () { /* ready */ };
 
   function loadYouTubeVideo(videoId, autoplay, startTime) {
-    if (ytPlayer) {
+    if (ytPlayer && ytPlayer.loadVideoById) {
       ytPlayer.loadVideoById({ videoId, startSeconds: startTime || 0 });
       if (!autoplay) {
-        setTimeout(() => { if (ytPlayer.pauseVideo) ytPlayer.pauseVideo(); }, 500);
+        setTimeout(() => { if (ytPlayer.pauseVideo) ytPlayer.pauseVideo(); }, 800);
       }
     } else {
       ytPlayer = new YT.Player('yt-player', {
@@ -434,7 +522,7 @@
       seekThumb.style.left = pct + '%';
       timeCurrent.textContent = formatTime(cur);
       timeTotal.textContent = formatTime(dur);
-    }, 500);
+    }, 400);
   }
 
   ytPlayBtn.addEventListener('click', () => {
@@ -498,28 +586,23 @@
 
     xhr.upload.addEventListener('progress', (e) => {
       if (e.lengthComputable) {
-        const pct = (e.loaded / e.total) * 100;
-        progressFill.style.width = pct + '%';
+        progressFill.style.width = ((e.loaded / e.total) * 100) + '%';
       }
     });
 
     xhr.addEventListener('load', () => {
       if (xhr.status === 200) {
         const resp = JSON.parse(xhr.responseText);
-        uploadStatus.textContent = `Uploaded: ${resp.file.originalName}`;
+        uploadStatus.textContent = `✓ ${resp.file.originalName}`;
         progressFill.style.width = '100%';
         setTimeout(() => { uploadProgress.classList.add('hidden'); }, 2000);
         loadFileList();
       } else {
         uploadStatus.textContent = 'Upload failed!';
-        progressFill.style.width = '0%';
       }
     });
 
-    xhr.addEventListener('error', () => {
-      uploadStatus.textContent = 'Upload error!';
-    });
-
+    xhr.addEventListener('error', () => { uploadStatus.textContent = 'Upload error!'; });
     xhr.send(formData);
   }
 
@@ -563,7 +646,6 @@
     document.querySelectorAll('.file-item').forEach(el => el.classList.remove('active'));
     const match = document.querySelector(`.file-item[data-url="${url}"]`);
     if (match) match.classList.add('active');
-    // Update index
     currentFileIndex = musicFiles.findIndex(f => f.url === url);
   }
 
@@ -581,7 +663,7 @@
   function handleChatMessage({ from, message }) {
     const div = document.createElement('div');
     div.className = 'chat-msg';
-    div.innerHTML = `<span class="chat-author">${from}</span><span class="chat-text">${escapeHtml(message)}</span>`;
+    div.innerHTML = `<span class="chat-author">${escapeHtml(from)}</span><span class="chat-text">${escapeHtml(message)}</span>`;
     chatMessages.appendChild(div);
     chatMessages.scrollTop = chatMessages.scrollHeight;
   }
