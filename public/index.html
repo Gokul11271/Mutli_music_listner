@@ -1,0 +1,176 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Multi Music Listener — Listen Together</title>
+  <meta name="description" content="Synchronized music player for groups. Upload files or play YouTube — everyone listens together in real time.">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+  <!-- ═══════ JOIN SCREEN ═══════ -->
+  <div id="join-screen" class="screen active">
+    <div class="join-container">
+      <div class="logo-area">
+        <div class="logo-icon">
+          <svg viewBox="0 0 64 64" fill="none"><circle cx="32" cy="32" r="30" stroke="url(#g1)" stroke-width="3"/><path d="M26 20v24l18-12z" fill="url(#g1)"/><defs><linearGradient id="g1" x1="0" y1="0" x2="64" y2="64"><stop stop-color="#a855f7"/><stop offset="1" stop-color="#06b6d4"/></linearGradient></defs></svg>
+        </div>
+        <h1>Multi Music Listener</h1>
+        <p class="tagline">Listen together in perfect sync</p>
+      </div>
+      <div class="join-form">
+        <div class="input-group">
+          <label for="room-input">Room Name</label>
+          <input type="text" id="room-input" placeholder="e.g. chill-vibes" autocomplete="off" maxlength="30">
+        </div>
+        <div class="input-group">
+          <label for="name-input">Your Name</label>
+          <input type="text" id="name-input" placeholder="e.g. Alex" autocomplete="off" maxlength="20">
+        </div>
+        <button id="join-btn" class="btn-primary">
+          <span>Join Room</span>
+          <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 12h14M12 5l7 7-7 7"/></svg>
+        </button>
+      </div>
+      <div class="join-features">
+        <div class="feature"><span class="feature-icon">🎵</span><span>Upload & share music files</span></div>
+        <div class="feature"><span class="feature-icon">▶️</span><span>Sync YouTube playback</span></div>
+        <div class="feature"><span class="feature-icon">👥</span><span>Multiple listeners in real-time</span></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ═══════ MAIN APP ═══════ -->
+  <div id="app-screen" class="screen">
+    <!-- Top Bar -->
+    <header class="top-bar">
+      <div class="top-left">
+        <div class="logo-mini">
+          <svg viewBox="0 0 64 64" width="28" height="28" fill="none"><circle cx="32" cy="32" r="30" stroke="url(#g2)" stroke-width="3"/><path d="M26 20v24l18-12z" fill="url(#g2)"/><defs><linearGradient id="g2" x1="0" y1="0" x2="64" y2="64"><stop stop-color="#a855f7"/><stop offset="1" stop-color="#06b6d4"/></linearGradient></defs></svg>
+        </div>
+        <div class="room-info">
+          <span class="room-label">Room</span>
+          <span id="room-name-display" class="room-name">—</span>
+        </div>
+      </div>
+      <div class="top-right">
+        <div class="online-indicator">
+          <span class="pulse-dot"></span>
+          <span id="user-count">0</span> online
+        </div>
+        <button id="leave-btn" class="btn-ghost" title="Leave Room">✕</button>
+      </div>
+    </header>
+
+    <!-- Main Content -->
+    <main class="main-content">
+      <!-- Left Panel: Sources -->
+      <section class="panel sources-panel">
+        <!-- YouTube Section -->
+        <div class="panel-section">
+          <h3 class="section-title">
+            <svg viewBox="0 0 24 24" width="18" height="18" fill="#ff0000"><path d="M23 9.71a8.5 8.5 0 00-.91-4C21.51 4.77 20.56 4 19.3 4H4.7C3.44 4 2.49 4.77 1.91 5.7A8.5 8.5 0 001 9.71v4.58a8.5 8.5 0 00.91 4c.58.93 1.53 1.71 2.79 1.71h14.6c1.26 0 2.21-.78 2.79-1.71a8.5 8.5 0 00.91-4V9.71zM10 15.5v-7l5.5 3.5-5.5 3.5z"/></svg>
+            YouTube
+          </h3>
+          <div class="yt-input-row">
+            <input type="text" id="yt-url-input" placeholder="Paste YouTube URL…" autocomplete="off">
+            <button id="yt-play-btn" class="btn-accent" title="Play YouTube">▶</button>
+          </div>
+          <div id="yt-container" class="yt-container hidden">
+            <div id="yt-player"></div>
+          </div>
+        </div>
+
+        <!-- Upload Section -->
+        <div class="panel-section">
+          <h3 class="section-title">
+            <svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor"><path d="M19.35 10.04A7.49 7.49 0 0012 4C9.11 4 6.6 5.64 5.35 8.04A5.994 5.994 0 000 14c0 3.31 2.69 6 6 6h13c2.76 0 5-2.24 5-5 0-2.64-2.05-4.78-4.65-4.96zM14 13v4h-4v-4H7l5-5 5 5h-3z"/></svg>
+            Upload Music
+          </h3>
+          <div class="upload-area" id="upload-area">
+            <input type="file" id="file-input" accept=".mp3,.wav,.ogg,.m4a,.flac,.aac,.webm" hidden>
+            <p>Drop audio file here or <button id="browse-btn" class="link-btn">browse</button></p>
+            <span class="upload-hint">MP3, WAV, OGG, M4A up to 50MB</span>
+          </div>
+          <div id="upload-progress" class="upload-progress hidden">
+            <div class="progress-bar"><div class="progress-fill" id="progress-fill"></div></div>
+            <span id="upload-status">Uploading…</span>
+          </div>
+        </div>
+
+        <!-- File List -->
+        <div class="panel-section file-list-section">
+          <h3 class="section-title">
+            <svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor"><path d="M12 3v10.55A4 4 0 1014 17V7h4V3h-6z"/></svg>
+            Music Library
+          </h3>
+          <ul id="file-list" class="file-list">
+            <li class="empty-state">No files uploaded yet</li>
+          </ul>
+        </div>
+      </section>
+
+      <!-- Right Panel: Users + Chat -->
+      <section class="panel users-panel">
+        <div class="panel-section">
+          <h3 class="section-title">
+            <svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor"><path d="M16 11c1.66 0 2.99-1.34 2.99-3S17.66 5 16 5c-1.66 0-3 1.34-3 3s1.34 3 3 3zm-8 0c1.66 0 2.99-1.34 2.99-3S9.66 5 8 5C6.34 5 5 6.34 5 8s1.34 3 3 3zm0 2c-2.33 0-7 1.17-7 3.5V19h14v-2.5c0-2.33-4.67-3.5-7-3.5zm8 0c-.29 0-.62.02-.97.05 1.16.84 1.97 1.97 1.97 3.45V19h6v-2.5c0-2.33-4.67-3.5-7-3.5z"/></svg>
+            Listeners
+          </h3>
+          <ul id="user-list" class="user-list"></ul>
+        </div>
+        <div class="panel-section chat-section">
+          <h3 class="section-title">
+            <svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor"><path d="M20 2H4c-1.1 0-2 .9-2 2v18l4-4h14c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2z"/></svg>
+            Chat
+          </h3>
+          <div id="chat-messages" class="chat-messages"></div>
+          <div class="chat-input-row">
+            <input type="text" id="chat-input" placeholder="Say something…" autocomplete="off" maxlength="200">
+            <button id="chat-send-btn" class="btn-accent" title="Send">➤</button>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <!-- Now Playing Bar -->
+    <footer class="now-playing-bar" id="now-playing-bar">
+      <div class="np-info">
+        <div class="np-visualizer" id="np-visualizer">
+          <span></span><span></span><span></span><span></span><span></span>
+        </div>
+        <div class="np-text">
+          <span class="np-title" id="np-title">Nothing playing</span>
+          <span class="np-source" id="np-source">—</span>
+        </div>
+      </div>
+      <div class="np-controls">
+        <button id="prev-btn" class="ctrl-btn" title="Previous">⏮</button>
+        <button id="play-pause-btn" class="ctrl-btn play-btn" title="Play/Pause">▶</button>
+        <button id="next-btn" class="ctrl-btn" title="Next">⏭</button>
+      </div>
+      <div class="np-progress">
+        <span id="time-current">0:00</span>
+        <div class="seek-bar" id="seek-bar">
+          <div class="seek-fill" id="seek-fill"></div>
+          <div class="seek-thumb" id="seek-thumb"></div>
+        </div>
+        <span id="time-total">0:00</span>
+      </div>
+      <div class="np-volume">
+        <svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor"><path d="M3 9v6h4l5 5V4L7 9H3zm13.5 3A4.5 4.5 0 0014 8.77v6.46A4.48 4.48 0 0016.5 12zM14 3.23v2.06a6.51 6.51 0 010 13.42v2.06A8.49 8.49 0 0022 12 8.49 8.49 0 0014 3.23z"/></svg>
+        <input type="range" id="volume-slider" min="0" max="100" value="80" class="volume-range">
+      </div>
+    </footer>
+
+    <!-- Hidden audio element -->
+    <audio id="audio-player" preload="auto"></audio>
+  </div>
+
+  <script src="/socket.io/socket.io.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>

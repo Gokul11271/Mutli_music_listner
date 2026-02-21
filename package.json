@@ -1,0 +1,16 @@
+{
+  "name": "multi-music-listener",
+  "version": "1.0.0",
+  "description": "Synchronized multi-user music player with file upload and YouTube support",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "multer": "^1.4.5-lts.1",
+    "socket.io": "^4.7.4",
+    "uuid": "^9.0.0"
+  }
+}
