@@ -42,6 +42,11 @@ const upload = multer({ storage, fileFilter, limits: { fileSize: 50 * 1024 * 102
 app.use(express.static(path.join(__dirname, 'public')));
 app.use('/uploads', express.static(uploadsDir));
 
+// ── Room link: /room/:roomName serves the same index.html ──
+app.get('/room/:roomName', (req, res) => {
+  res.sendFile(path.join(__dirname, 'public', 'index.html'));
+});
+
 // Upload endpoint
 app.post('/upload', upload.single('music'), (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'No file uploaded or invalid file type' });
@@ -76,15 +81,23 @@ app.get('/api/files', (req, res) => {
   res.json(files);
 });
 
-// ══════════════════════════════════════════════
-// SOCKET.IO — Room & Sync Engine
-// ══════════════════════════════════════════════
+// List active rooms
+app.get('/api/rooms', (req, res) => {
+  const list = [];
+  rooms.forEach((room, id) => {
+    list.push({
+      id,
+      userCount: room.users.size,
+      nowPlaying: room.state.name || null,
+      type: room.state.type
+    });
+  });
+  res.json(list);
+});
 
-// Room state is the single source of truth.
-// When music plays, we record the server timestamp of when
-// playback "would have started from 0" (playStartedAt).
-// This way any user can compute: currentTime = (now - playStartedAt) / 1000
-// and seek to the correct position immediately.
+// ══════════════════════════════════════════════
+// SOCKET.IO — Room, Sync & Playlist Engine
+// ══════════════════════════════════════════════
 
 const rooms = new Map();
 
@@ -92,16 +105,16 @@ function getRoomState(roomId) {
   if (!rooms.has(roomId)) {
     rooms.set(roomId, {
       users: new Map(),
+      queue: [],       // playlist queue: [{ id, type, src, name, addedBy }]
+      queueIndex: -1,  // current track index in queue
       state: {
-        type: null,       // 'file' or 'youtube'
+        type: null,
         src: null,
         name: null,
         playing: false,
         currentTime: 0,
-        // Server timestamp (ms) representing when the track
-        // would have been at 0:00 if it played continuously.
         playStartedAt: null,
-        pausedAt: 0        // the currentTime when paused
+        pausedAt: 0
       }
     });
   }
@@ -117,6 +130,33 @@ function userList(room) {
   return Array.from(room.users.entries()).map(([id, u]) => ({ id, ...u }));
 }
 
+function playTrackFromQueue(roomId, index) {
+  const room = rooms.get(roomId);
+  if (!room || index < 0 || index >= room.queue.length) return;
+
+  room.queueIndex = index;
+  const track = room.queue[index];
+
+  room.state = {
+    type: track.type,
+    src: track.src,
+    name: track.name,
+    playing: true,
+    currentTime: 0,
+    playStartedAt: Date.now(),
+    pausedAt: 0
+  };
+
+  io.to(roomId).emit('track-changed', {
+    ...room.state,
+    currentTime: 0,
+    serverTime: Date.now(),
+    queueIndex: index
+  });
+
+  io.to(roomId).emit('queue-updated', { queue: room.queue, queueIndex: room.queueIndex });
+}
+
 io.on('connection', (socket) => {
   console.log(`✓ Connected: ${socket.id}`);
 
@@ -129,13 +169,14 @@ io.on('connection', (socket) => {
     socket.roomId = roomId;
     socket.userName = userName;
 
-    // Send authoritative state with computed time
     const st = { ...room.state, currentTime: computeCurrentTime(room.state), serverTime: Date.now() };
 
     socket.emit('room-joined', {
       roomId, isHost,
       users: userList(room),
-      state: st
+      state: st,
+      queue: room.queue,
+      queueIndex: room.queueIndex
     });
 
     socket.to(roomId).emit('user-joined', {
@@ -146,40 +187,103 @@ io.on('connection', (socket) => {
     console.log(`  → ${userName} joined "${roomId}" (${isHost ? 'HOST' : 'guest'})`);
   });
 
-  // ── PLAY FILE ──────────────────────────
+  // ── ADD TO QUEUE ───────────────────────
+  socket.on('queue-add', ({ type, src, name }) => {
+    const room = rooms.get(socket.roomId);
+    if (!room) return;
+
+    const track = {
+      id: uuidv4().slice(0, 8),
+      type,
+      src,
+      name,
+      addedBy: socket.userName
+    };
+    room.queue.push(track);
+
+    io.to(socket.roomId).emit('queue-updated', { queue: room.queue, queueIndex: room.queueIndex });
+
+    // If nothing is playing, auto-play first track
+    if (room.queueIndex === -1 || !room.state.src) {
+      playTrackFromQueue(socket.roomId, room.queue.length - 1);
+    }
+  });
+
+  // ── REMOVE FROM QUEUE ─────────────────
+  socket.on('queue-remove', ({ trackId }) => {
+    const room = rooms.get(socket.roomId);
+    if (!room) return;
+
+    const idx = room.queue.findIndex(t => t.id === trackId);
+    if (idx === -1) return;
+
+    room.queue.splice(idx, 1);
+
+    // Adjust current index
+    if (idx < room.queueIndex) {
+      room.queueIndex--;
+    } else if (idx === room.queueIndex) {
+      // Current track removed, play next or stop
+      if (room.queue.length > 0) {
+        const newIdx = Math.min(room.queueIndex, room.queue.length - 1);
+        playTrackFromQueue(socket.roomId, newIdx);
+      } else {
+        room.queueIndex = -1;
+        room.state = { type: null, src: null, name: null, playing: false, currentTime: 0, playStartedAt: null, pausedAt: 0 };
+        io.to(socket.roomId).emit('track-changed', { ...room.state, serverTime: Date.now() });
+      }
+    }
+
+    io.to(socket.roomId).emit('queue-updated', { queue: room.queue, queueIndex: room.queueIndex });
+  });
+
+  // ── PLAY SPECIFIC QUEUE INDEX ──────────
+  socket.on('queue-play', ({ index }) => {
+    playTrackFromQueue(socket.roomId, index);
+  });
+
+  // ── PLAY FILE (also adds to queue) ─────
   socket.on('play-file', ({ url, name }) => {
     const room = rooms.get(socket.roomId);
     if (!room) return;
-    room.state = {
-      type: 'file', src: url, name,
-      playing: true,
-      currentTime: 0,
-      playStartedAt: Date.now(),
-      pausedAt: 0
-    };
-    io.to(socket.roomId).emit('track-changed', {
-      ...room.state,
-      currentTime: 0,
-      serverTime: Date.now()
-    });
+
+    // Check if already in queue
+    let idx = room.queue.findIndex(t => t.src === url);
+    if (idx === -1) {
+      room.queue.push({ id: uuidv4().slice(0, 8), type: 'file', src: url, name, addedBy: socket.userName });
+      idx = room.queue.length - 1;
+    }
+
+    playTrackFromQueue(socket.roomId, idx);
   });
 
-  // ── PLAY YOUTUBE ───────────────────────
+  // ── PLAY YOUTUBE (also adds to queue) ──
   socket.on('play-youtube', ({ videoId, title }) => {
     const room = rooms.get(socket.roomId);
     if (!room) return;
-    room.state = {
-      type: 'youtube', src: videoId, name: title || 'YouTube Video',
-      playing: true,
-      currentTime: 0,
-      playStartedAt: Date.now(),
-      pausedAt: 0
-    };
-    io.to(socket.roomId).emit('track-changed', {
-      ...room.state,
-      currentTime: 0,
-      serverTime: Date.now()
-    });
+
+    let idx = room.queue.findIndex(t => t.src === videoId);
+    if (idx === -1) {
+      room.queue.push({ id: uuidv4().slice(0, 8), type: 'youtube', src: videoId, name: title || 'YouTube Video', addedBy: socket.userName });
+      idx = room.queue.length - 1;
+    }
+
+    playTrackFromQueue(socket.roomId, idx);
+  });
+
+  // ── NEXT / PREVIOUS ───────────────────
+  socket.on('queue-next', () => {
+    const room = rooms.get(socket.roomId);
+    if (!room || room.queue.length === 0) return;
+    const next = (room.queueIndex + 1) % room.queue.length;
+    playTrackFromQueue(socket.roomId, next);
+  });
+
+  socket.on('queue-prev', () => {
+    const room = rooms.get(socket.roomId);
+    if (!room || room.queue.length === 0) return;
+    const prev = (room.queueIndex - 1 + room.queue.length) % room.queue.length;
+    playTrackFromQueue(socket.roomId, prev);
   });
 
   // ── TRANSPORT (play/pause/seek) ────────
@@ -189,7 +293,6 @@ io.on('connection', (socket) => {
     const st = room.state;
 
     if (action === 'play') {
-      // Resume from wherever we paused
       st.playing = true;
       st.playStartedAt = Date.now() - (st.pausedAt * 1000);
       st.currentTime = st.pausedAt;
@@ -210,7 +313,6 @@ io.on('connection', (socket) => {
       }
     }
 
-    // Broadcast full state so every client can hard-sync
     io.to(socket.roomId).emit('sync-state', {
       ...st,
       currentTime: computeCurrentTime(st),
@@ -218,7 +320,7 @@ io.on('connection', (socket) => {
     });
   });
 
-  // ── SYNC REQUEST (late joiner / periodic) ──
+  // ── SYNC REQUEST ───────────────────────
   socket.on('sync-request', () => {
     const room = rooms.get(socket.roomId);
     if (!room) return;
@@ -229,7 +331,7 @@ io.on('connection', (socket) => {
     });
   });
 
-  // ── HEARTBEAT — server pushes time to all in room ──
+  // ── HEARTBEAT ──────────────────────────
   socket.on('heartbeat', () => {
     const room = rooms.get(socket.roomId);
     if (!room || !room.state.playing) return;
@@ -237,6 +339,23 @@ io.on('connection', (socket) => {
       currentTime: computeCurrentTime(room.state),
       serverTime: Date.now()
     });
+  });
+
+  // ── TRACK ENDED (auto-next) ────────────
+  socket.on('track-ended', () => {
+    const room = rooms.get(socket.roomId);
+    if (!room || room.queue.length === 0) return;
+    // Only the first user to report ended triggers next
+    const next = room.queueIndex + 1;
+    if (next < room.queue.length) {
+      playTrackFromQueue(socket.roomId, next);
+    } else {
+      // End of queue
+      room.state.playing = false;
+      room.state.pausedAt = 0;
+      room.state.playStartedAt = null;
+      io.to(socket.roomId).emit('sync-state', { ...room.state, currentTime: 0, serverTime: Date.now() });
+    }
   });
 
   // ── CHAT ────────────────────────────────

@@ -10,7 +10,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap"
     rel="stylesheet">
-  <link rel="stylesheet" href="style.css">
+  <link rel="stylesheet" href="/style.css">
 </head>
 
 <body>
@@ -45,9 +45,21 @@
         </button>
       </div>
       <div class="join-features">
-        <div class="feature"><span class="feature-icon">🎵</span><span>Upload & share music files</span></div>
-        <div class="feature"><span class="feature-icon">▶️</span><span>Sync YouTube playback</span></div>
-        <div class="feature"><span class="feature-icon">👥</span><span>Multiple listeners in real-time</span></div>
+        <div class="feature"><span class="feature-icon">🎵</span><span>Upload & share music</span></div>
+        <div class="feature"><span class="feature-icon">▶️</span><span>Sync YouTube</span></div>
+        <div class="feature"><span class="feature-icon">👥</span><span>Real-time listeners</span></div>
+        <div class="feature"><span class="feature-icon">📋</span><span>Playlist queue</span></div>
+      </div>
+
+      <!-- Active Rooms -->
+      <div id="active-rooms" class="active-rooms" style="display:none">
+        <h3 class="section-title" style="justify-content:center;margin-top:28px;">
+          <svg viewBox="0 0 24 24" width="16" height="16" fill="#1db954">
+            <path d="M12 3v10.55A4 4 0 1014 17V7h4V3h-6z" />
+          </svg>
+          Active Rooms
+        </h3>
+        <div id="rooms-list" class="rooms-list"></div>
       </div>
     </div>
   </div>
@@ -69,6 +81,13 @@
         </div>
       </div>
       <div class="top-right">
+        <button id="share-btn" class="btn-share" title="Copy room link">
+          <svg viewBox="0 0 24 24" width="16" height="16" fill="currentColor">
+            <path
+              d="M18 16.08c-.76 0-1.44.3-1.96.77L8.91 12.7c.05-.23.09-.46.09-.7s-.04-.47-.09-.7l7.05-4.11c.54.5 1.25.81 2.04.81 1.66 0 3-1.34 3-3s-1.34-3-3-3-3 1.34-3 3c0 .24.04.47.09.7L8.04 9.81C7.5 9.31 6.79 9 6 9c-1.66 0-3 1.34-3 3s1.34 3 3 3c.79 0 1.5-.31 2.04-.81l7.12 4.16c-.05.21-.08.43-.08.65 0 1.61 1.31 2.92 2.92 2.92 1.61 0 2.92-1.31 2.92-2.92s-1.31-2.92-2.92-2.92z" />
+          </svg>
+          Share
+        </button>
         <div class="sync-indicator" id="sync-indicator" style="display:none">
           <span class="sync-dot"></span>
           <span>Synced</span>
@@ -83,7 +102,7 @@
 
     <!-- Main Content -->
     <main class="main-content">
-      <!-- Left Panel: Sources -->
+      <!-- Left Panel: Sources + Queue -->
       <section class="panel sources-panel">
         <!-- YouTube Section -->
         <div class="panel-section">
@@ -125,8 +144,8 @@
           </div>
         </div>
 
-        <!-- File List -->
-        <div class="panel-section file-list-section">
+        <!-- File Library -->
+        <div class="panel-section">
           <h3 class="section-title">
             <svg viewBox="0 0 24 24" width="18" height="18" fill="#1db954">
               <path d="M12 3v10.55A4 4 0 1014 17V7h4V3h-6z" />
@@ -135,6 +154,20 @@
           </h3>
           <ul id="file-list" class="file-list">
             <li class="empty-state">No files uploaded yet</li>
+          </ul>
+        </div>
+
+        <!-- Queue -->
+        <div class="panel-section">
+          <h3 class="section-title">
+            <svg viewBox="0 0 24 24" width="18" height="18" fill="#1db954">
+              <path
+                d="M15 6H3v2h12V6zm0 4H3v2h12v-2zM3 16h8v-2H3v2zM17 6v8.18c-.31-.11-.65-.18-1-.18-1.66 0-3 1.34-3 3s1.34 3 3 3 3-1.34 3-3V8h3V6h-5z" />
+            </svg>
+            Queue <span id="queue-count" class="queue-count">0</span>
+          </h3>
+          <ul id="queue-list" class="queue-list">
+            <li class="empty-state">Queue is empty</li>
           </ul>
         </div>
       </section>
@@ -170,8 +203,10 @@
     <!-- Now Playing Bar -->
     <footer class="now-playing-bar" id="now-playing-bar">
       <div class="np-info">
-        <div class="np-visualizer" id="np-visualizer">
-          <span></span><span></span><span></span><span></span><span></span>
+        <div class="np-thumb" id="np-thumb">
+          <div class="np-visualizer" id="np-visualizer">
+            <span></span><span></span><span></span><span></span><span></span>
+          </div>
         </div>
         <div class="np-text">
           <span class="np-title" id="np-title">Nothing playing</span>
@@ -179,9 +214,9 @@
         </div>
       </div>
       <div class="np-controls">
-        <button id="prev-btn" class="ctrl-btn" title="Previous">⏮</button>
-        <button id="play-pause-btn" class="ctrl-btn play-btn" title="Play/Pause">▶</button>
-        <button id="next-btn" class="ctrl-btn" title="Next">⏭</button>
+        <button id="prev-btn" class="ctrl-btn" title="Previous (Shift+←)">⏮</button>
+        <button id="play-pause-btn" class="ctrl-btn play-btn" title="Play/Pause (Space)">▶</button>
+        <button id="next-btn" class="ctrl-btn" title="Next (Shift+→)">⏭</button>
       </div>
       <div class="np-progress">
         <span id="time-current">0:00</span>
@@ -200,12 +235,26 @@
       </div>
     </footer>
 
+    <!-- Copied toast -->
+    <div id="copy-toast" class="copy-toast">✓ Room link copied!</div>
+
+    <!-- Keyboard shortcuts tooltip -->
+    <div id="shortcuts-tip" class="shortcuts-tip" style="display:none">
+      <strong>Keyboard Shortcuts</strong>
+      <div>Space — Play/Pause</div>
+      <div>← / → — Seek ±5s</div>
+      <div>Shift+← / Shift+→ — Prev/Next track</div>
+      <div>↑ / ↓ — Volume</div>
+      <div>M — Mute/Unmute</div>
+      <div>? — Toggle this help</div>
+    </div>
+
     <!-- Hidden audio element -->
     <audio id="audio-player" preload="auto"></audio>
   </div>
 
   <script src="/socket.io/socket.io.js"></script>
-  <script src="app.js"></script>
+  <script src="/app.js"></script>
 </body>
 
 </html>

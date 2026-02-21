@@ -1,6 +1,6 @@
 /* ═══════════════════════════════════════════
    Multi Music Listener — Client Application
-   Enhanced sync: server-authoritative time
+   v2: Queue, Keyboard Shortcuts, Room Sharing
    ═══════════════════════════════════════════ */
 
 (function () {
@@ -15,7 +15,10 @@
   const roomNameDisplay = document.getElementById('room-name-display');
   const userCountEl = document.getElementById('user-count');
   const leaveBtn = document.getElementById('leave-btn');
+  const shareBtn = document.getElementById('share-btn');
   const syncIndicator = document.getElementById('sync-indicator');
+  const copyToast = document.getElementById('copy-toast');
+  const shortcutsTip = document.getElementById('shortcuts-tip');
 
   const ytUrlInput = document.getElementById('yt-url-input');
   const ytPlayBtn = document.getElementById('yt-play-btn');
@@ -27,8 +30,10 @@
   const uploadProgress = document.getElementById('upload-progress');
   const progressFill = document.getElementById('progress-fill');
   const uploadStatus = document.getElementById('upload-status');
-
   const fileListEl = document.getElementById('file-list');
+
+  const queueListEl = document.getElementById('queue-list');
+  const queueCountEl = document.getElementById('queue-count');
 
   const audioPlayer = document.getElementById('audio-player');
   const playPauseBtn = document.getElementById('play-pause-btn');
@@ -37,6 +42,7 @@
   const npTitle = document.getElementById('np-title');
   const npSource = document.getElementById('np-source');
   const npVisualizer = document.getElementById('np-visualizer');
+  const npThumb = document.getElementById('np-thumb');
   const seekBar = document.getElementById('seek-bar');
   const seekFill = document.getElementById('seek-fill');
   const seekThumb = document.getElementById('seek-thumb');
@@ -49,22 +55,25 @@
   const chatInput = document.getElementById('chat-input');
   const chatSendBtn = document.getElementById('chat-send-btn');
 
+  const activeRoomsDiv = document.getElementById('active-rooms');
+  const roomsListEl = document.getElementById('rooms-list');
+
   // ─── State ────────────────────────────
   let socket = null;
   let currentRoom = null;
   let userName = null;
   let isHost = false;
   let musicFiles = [];
-  let currentFileIndex = -1;
   let currentType = null;
   let ytPlayer = null;
   let ytReady = false;
   let isSeeking = false;
   let suppressTransport = false;
+  let queue = [];
+  let queueIndex = -1;
+  let prevVolume = 80;
 
-  // Sync tolerance: if drift > this many seconds, hard-seek to correct position
   const SYNC_TOLERANCE = 0.8;
-  // How often (ms) the client asks the server for the authoritative time
   const HEARTBEAT_INTERVAL = 3000;
   let heartbeatTimer = null;
 
@@ -94,6 +103,10 @@
     return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
   }
 
+  function getYouTubeThumbnail(videoId) {
+    return `https://img.youtube.com/vi/${videoId}/mqdefault.jpg`;
+  }
+
   const avatarColors = [
     '#1db954', '#1ed760', '#f43f5e', '#10b981', '#f59e0b',
     '#3b82f6', '#ec4899', '#8b5cf6', '#14b8a6', '#ef4444'
@@ -105,6 +118,43 @@
     return avatarColors[Math.abs(hash) % avatarColors.length];
   }
 
+  function escapeHtml(str) {
+    const div = document.createElement('div');
+    div.textContent = str;
+    return div.innerHTML;
+  }
+
+  // ─── Room link auto-fill from URL ─────
+  (function checkUrl() {
+    const match = window.location.pathname.match(/^\/room\/(.+)$/);
+    if (match) {
+      roomInput.value = decodeURIComponent(match[1]);
+      nameInput.focus();
+    }
+  })();
+
+  // ─── Load active rooms on join screen ──
+  (function loadActiveRooms() {
+    fetch('/api/rooms')
+      .then(r => r.json())
+      .then(rooms => {
+        if (rooms.length === 0) { activeRoomsDiv.style.display = 'none'; return; }
+        activeRoomsDiv.style.display = 'block';
+        roomsListEl.innerHTML = '';
+        rooms.forEach(r => {
+          const div = document.createElement('div');
+          div.className = 'room-card';
+          div.innerHTML = `
+            <span class="room-card-name">${escapeHtml(r.id)}</span>
+            <span class="room-card-info">${r.userCount} listener${r.userCount !== 1 ? 's' : ''}${r.nowPlaying ? ' · ' + escapeHtml(r.nowPlaying) : ''}</span>
+          `;
+          div.addEventListener('click', () => { roomInput.value = r.id; nameInput.focus(); });
+          roomsListEl.appendChild(div);
+        });
+      })
+      .catch(() => {});
+  })();
+
   // ─── Join Room ────────────────────────
   joinBtn.addEventListener('click', joinRoom);
   roomInput.addEventListener('keydown', e => { if (e.key === 'Enter') nameInput.focus(); });
@@ -113,31 +163,26 @@
   function joinRoom() {
     const room = roomInput.value.trim();
     const name = nameInput.value.trim();
-    if (!room || !name) {
-      alert('Please enter both a room name and your name.');
-      return;
-    }
+    if (!room || !name) { alert('Please enter both a room name and your name.'); return; }
 
     currentRoom = room;
     userName = name;
 
+    // Update URL to shareable room link
+    window.history.replaceState(null, '', `/room/${encodeURIComponent(room)}`);
+
     socket = io();
 
-    socket.on('connect', () => {
-      socket.emit('join-room', { roomId: room, userName: name });
-    });
-
+    socket.on('connect', () => { socket.emit('join-room', { roomId: room, userName: name }); });
     socket.on('room-joined', handleRoomJoined);
     socket.on('user-joined', handleUserJoined);
     socket.on('user-left', handleUserLeft);
-    socket.on('promoted-to-host', () => {
-      isHost = true;
-      addSystemChat('You are now the host!');
-    });
+    socket.on('promoted-to-host', () => { isHost = true; addSystemChat('You are now the host!'); });
     socket.on('track-changed', handleTrackChanged);
     socket.on('sync-state', handleSyncState);
     socket.on('heartbeat-ack', handleHeartbeat);
     socket.on('chat-message', handleChatMessage);
+    socket.on('queue-updated', handleQueueUpdated);
 
     joinScreen.classList.remove('active');
     appScreen.classList.add('active');
@@ -158,52 +203,48 @@
     ytContainer.classList.add('hidden');
     resetNowPlaying();
     currentType = null;
+    queue = [];
+    queueIndex = -1;
+    window.history.replaceState(null, '', '/');
   });
 
-  // ─── Heartbeat (periodic sync check) ──
+  // ─── Share Room Link ──────────────────
+  shareBtn.addEventListener('click', () => {
+    const url = window.location.origin + '/room/' + encodeURIComponent(currentRoom);
+    navigator.clipboard.writeText(url).then(() => {
+      copyToast.classList.add('show');
+      setTimeout(() => copyToast.classList.remove('show'), 2500);
+    }).catch(() => {
+      prompt('Copy this room link:', url);
+    });
+  });
+
+  // ─── Heartbeat ────────────────────────
   function startHeartbeat() {
     stopHeartbeat();
     heartbeatTimer = setInterval(() => {
-      if (socket && socket.connected) {
-        socket.emit('heartbeat');
-      }
+      if (socket && socket.connected) socket.emit('heartbeat');
     }, HEARTBEAT_INTERVAL);
   }
+  function stopHeartbeat() { if (heartbeatTimer) { clearInterval(heartbeatTimer); heartbeatTimer = null; } }
 
-  function stopHeartbeat() {
-    if (heartbeatTimer) { clearInterval(heartbeatTimer); heartbeatTimer = null; }
-  }
-
-  function handleHeartbeat({ currentTime, serverTime }) {
+  function handleHeartbeat({ currentTime }) {
     if (!currentType || isSeeking) return;
     correctDrift(currentTime);
   }
 
-  // Correct drift: if local playback is off by more than SYNC_TOLERANCE, hard-seek
   function correctDrift(serverCurrentTime) {
     if (isSeeking || suppressTransport) return;
-
     let localTime = 0;
-    if (currentType === 'file') {
-      localTime = audioPlayer.currentTime || 0;
-    } else if (currentType === 'youtube' && ytPlayer && ytReady) {
-      localTime = ytPlayer.getCurrentTime() || 0;
-    } else {
-      return;
-    }
+    if (currentType === 'file') localTime = audioPlayer.currentTime || 0;
+    else if (currentType === 'youtube' && ytPlayer && ytReady) localTime = ytPlayer.getCurrentTime() || 0;
+    else return;
 
     const drift = Math.abs(localTime - serverCurrentTime);
-
     if (drift > SYNC_TOLERANCE) {
-      console.log(`[sync] Drift ${drift.toFixed(2)}s → correcting to ${serverCurrentTime.toFixed(2)}s`);
       suppressTransport = true;
-
-      if (currentType === 'file') {
-        audioPlayer.currentTime = serverCurrentTime;
-      } else if (currentType === 'youtube' && ytPlayer && ytReady) {
-        ytPlayer.seekTo(serverCurrentTime, true);
-      }
-
+      if (currentType === 'file') audioPlayer.currentTime = serverCurrentTime;
+      else if (currentType === 'youtube' && ytPlayer && ytReady) ytPlayer.seekTo(serverCurrentTime, true);
       setTimeout(() => { suppressTransport = false; }, 500);
       showSyncIndicator();
     }
@@ -211,31 +252,21 @@
 
   function showSyncIndicator() {
     syncIndicator.style.display = 'flex';
-    clearTimeout(syncIndicator._hideTimer);
-    syncIndicator._hideTimer = setTimeout(() => {
-      syncIndicator.style.display = 'none';
-    }, 3000);
+    clearTimeout(syncIndicator._t);
+    syncIndicator._t = setTimeout(() => { syncIndicator.style.display = 'none'; }, 3000);
   }
 
   // ─── Room Events ──────────────────────
   function handleRoomJoined(data) {
     isHost = data.isHost;
     updateUserList(data.users);
-    if (data.state && data.state.src) {
-      handleTrackChanged(data.state);
-    }
+    if (data.queue) { queue = data.queue; queueIndex = data.queueIndex; renderQueue(); }
+    if (data.state && data.state.src) handleTrackChanged(data.state);
     addSystemChat(`You joined room "${data.roomId}"${data.isHost ? ' as host' : ''}`);
   }
 
-  function handleUserJoined(data) {
-    updateUserList(data.users);
-    addSystemChat(`${data.name} joined the room`);
-  }
-
-  function handleUserLeft(data) {
-    updateUserList(data.users);
-    addSystemChat(`${data.name} left the room`);
-  }
+  function handleUserJoined(data) { updateUserList(data.users); addSystemChat(`${data.name} joined`); }
+  function handleUserLeft(data) { updateUserList(data.users); addSystemChat(`${data.name} left`); }
 
   function updateUserList(users) {
     userCountEl.textContent = users.length;
@@ -245,10 +276,48 @@
       li.className = 'user-item';
       li.innerHTML = `
         <div class="user-avatar" style="background:${getAvatarColor(u.name)}">${u.name[0].toUpperCase()}</div>
-        <span class="user-name">${u.name}</span>
+        <span class="user-name">${escapeHtml(u.name)}</span>
         ${u.isHost ? '<span class="user-badge">Host</span>' : ''}
       `;
       userListEl.appendChild(li);
+    });
+  }
+
+  // ─── Queue ────────────────────────────
+  function handleQueueUpdated({ queue: q, queueIndex: qi }) {
+    queue = q;
+    queueIndex = qi;
+    renderQueue();
+  }
+
+  function renderQueue() {
+    queueCountEl.textContent = queue.length;
+    queueListEl.innerHTML = '';
+    if (queue.length === 0) {
+      queueListEl.innerHTML = '<li class="empty-state">Queue is empty</li>';
+      return;
+    }
+    queue.forEach((track, i) => {
+      const li = document.createElement('li');
+      li.className = 'queue-item' + (i === queueIndex ? ' active' : '');
+      li.innerHTML = `
+        <span class="q-num">${i + 1}</span>
+        <span class="q-icon">${track.type === 'youtube' ? '▶' : '🎵'}</span>
+        <div class="q-info">
+          <div class="q-name">${escapeHtml(track.name)}</div>
+          <div class="q-added">by ${escapeHtml(track.addedBy)}</div>
+        </div>
+        <button class="q-remove" data-id="${track.id}" title="Remove">✕</button>
+      `;
+      li.addEventListener('click', (e) => {
+        if (e.target.classList.contains('q-remove')) return;
+        socket.emit('queue-play', { index: i });
+      });
+      li.querySelector('.q-remove').addEventListener('click', (e) => {
+        e.stopPropagation();
+        socket.emit('queue-remove', { trackId: track.id });
+      });
+      queueListEl.appendChild(li);
     });
   }
 
@@ -256,6 +325,10 @@
   function handleTrackChanged(state) {
     currentType = state.type;
     suppressTransport = true;
+
+    // Update thumbnail
+    const existingImg = npThumb.querySelector('img');
+    if (existingImg) existingImg.remove();
 
     if (state.type === 'file') {
       if (ytPlayer && ytPlayer.stopVideo) ytPlayer.stopVideo();
@@ -267,12 +340,8 @@
 
       audioPlayer.addEventListener('canplay', function onCanPlay() {
         audioPlayer.removeEventListener('canplay', onCanPlay);
-        // Seek to server's authoritative time
         audioPlayer.currentTime = state.currentTime || 0;
-        if (state.playing) {
-          audioPlayer.play().catch(() => {});
-          setPlayingUI(true);
-        }
+        if (state.playing) { audioPlayer.play().catch(() => {}); setPlayingUI(true); }
         setTimeout(() => { suppressTransport = false; }, 500);
       });
 
@@ -285,48 +354,40 @@
       npTitle.textContent = state.name || 'YouTube Video';
       npSource.textContent = '▶ YouTube';
 
+      // YouTube thumbnail
+      const img = document.createElement('img');
+      img.src = getYouTubeThumbnail(state.src);
+      img.alt = 'thumbnail';
+      npThumb.appendChild(img);
+
       ytContainer.classList.remove('hidden');
       loadYouTubeVideo(state.src, state.playing, state.currentTime || 0);
       setPlayingUI(state.playing);
       setTimeout(() => { suppressTransport = false; }, 1000);
     }
 
+    if (state.queueIndex !== undefined) {
+      queueIndex = state.queueIndex;
+      renderQueue();
+    }
     showSyncIndicator();
   }
 
-  // ─── Sync State (from server broadcast or heartbeat) ──
   function handleSyncState(state) {
     if (!state || !state.src) return;
-
-    // If track changed, handle as new track
-    if (state.src !== getCurrentSrc()) {
-      handleTrackChanged(state);
-      return;
-    }
+    if (state.src !== getCurrentSrc()) { handleTrackChanged(state); return; }
 
     suppressTransport = true;
-
-    // Apply play/pause state
     if (state.playing) {
-      if (currentType === 'file' && audioPlayer.paused) {
-        audioPlayer.play().catch(() => {});
-      } else if (currentType === 'youtube' && ytPlayer && ytReady) {
-        const ytState = ytPlayer.getPlayerState();
-        if (ytState !== YT.PlayerState.PLAYING) ytPlayer.playVideo();
-      }
+      if (currentType === 'file' && audioPlayer.paused) audioPlayer.play().catch(() => {});
+      else if (currentType === 'youtube' && ytPlayer && ytReady && ytPlayer.getPlayerState() !== YT.PlayerState.PLAYING) ytPlayer.playVideo();
       setPlayingUI(true);
     } else {
-      if (currentType === 'file' && !audioPlayer.paused) {
-        audioPlayer.pause();
-      } else if (currentType === 'youtube' && ytPlayer && ytReady) {
-        ytPlayer.pauseVideo();
-      }
+      if (currentType === 'file' && !audioPlayer.paused) audioPlayer.pause();
+      else if (currentType === 'youtube' && ytPlayer && ytReady) ytPlayer.pauseVideo();
       setPlayingUI(false);
     }
-
-    // Correct time position
     correctDrift(state.currentTime);
-
     setTimeout(() => { suppressTransport = false; }, 500);
   }
 
@@ -337,7 +398,9 @@
   }
 
   // ─── Player Controls ─────────────────
-  playPauseBtn.addEventListener('click', () => {
+  playPauseBtn.addEventListener('click', togglePlayPause);
+
+  function togglePlayPause() {
     if (currentType === 'file') {
       if (audioPlayer.paused) {
         audioPlayer.play().catch(() => {});
@@ -349,8 +412,7 @@
         setPlayingUI(false);
       }
     } else if (currentType === 'youtube' && ytPlayer && ytReady) {
-      const st = ytPlayer.getPlayerState();
-      if (st === YT.PlayerState.PLAYING) {
+      if (ytPlayer.getPlayerState() === YT.PlayerState.PLAYING) {
         ytPlayer.pauseVideo();
         socket.emit('transport', { action: 'pause', currentTime: ytPlayer.getCurrentTime() });
         setPlayingUI(false);
@@ -360,31 +422,14 @@
         setPlayingUI(true);
       }
     }
-  });
+  }
 
-  prevBtn.addEventListener('click', () => {
-    if (currentType === 'file' && musicFiles.length > 0) {
-      currentFileIndex = (currentFileIndex - 1 + musicFiles.length) % musicFiles.length;
-      const file = musicFiles[currentFileIndex];
-      socket.emit('play-file', { url: file.url, name: file.originalName || file.filename });
-    }
-  });
-
-  nextBtn.addEventListener('click', () => {
-    if (currentType === 'file' && musicFiles.length > 0) {
-      currentFileIndex = (currentFileIndex + 1) % musicFiles.length;
-      const file = musicFiles[currentFileIndex];
-      socket.emit('play-file', { url: file.url, name: file.originalName || file.filename });
-    }
-  });
+  prevBtn.addEventListener('click', () => { if (socket) socket.emit('queue-prev'); });
+  nextBtn.addEventListener('click', () => { if (socket) socket.emit('queue-next'); });
 
   function setPlayingUI(playing) {
     playPauseBtn.textContent = playing ? '⏸' : '▶';
-    if (playing) {
-      npVisualizer.classList.add('playing');
-    } else {
-      npVisualizer.classList.remove('playing');
-    }
+    npVisualizer.classList.toggle('playing', playing);
   }
 
   function resetNowPlaying() {
@@ -395,6 +440,8 @@
     seekThumb.style.left = '0%';
     timeCurrent.textContent = '0:00';
     timeTotal.textContent = '0:00';
+    const img = npThumb.querySelector('img');
+    if (img) img.remove();
   }
 
   // ─── Audio Progress ───────────────────
@@ -408,13 +455,7 @@
   });
 
   audioPlayer.addEventListener('ended', () => {
-    if (musicFiles.length > 1) {
-      currentFileIndex = (currentFileIndex + 1) % musicFiles.length;
-      const file = musicFiles[currentFileIndex];
-      socket.emit('play-file', { url: file.url, name: file.originalName || file.filename });
-    } else {
-      setPlayingUI(false);
-    }
+    if (socket) socket.emit('track-ended');
   });
 
   // Seek bar
@@ -455,8 +496,7 @@
       audioPlayer.currentTime = t;
       socket.emit('transport', { action: 'seek', currentTime: t });
     } else if (currentType === 'youtube' && ytPlayer && ytReady) {
-      const dur = ytPlayer.getDuration();
-      const t = pct * dur;
+      const t = pct * ytPlayer.getDuration();
       ytPlayer.seekTo(t, true);
       socket.emit('transport', { action: 'seek', currentTime: t });
     }
@@ -467,6 +507,7 @@
     const vol = volumeSlider.value / 100;
     audioPlayer.volume = vol;
     if (ytPlayer && ytReady) ytPlayer.setVolume(volumeSlider.value);
+    prevVolume = volumeSlider.value;
   });
   audioPlayer.volume = 0.8;
 
@@ -474,36 +515,22 @@
   const ytScript = document.createElement('script');
   ytScript.src = 'https://www.youtube.com/iframe_api';
   document.head.appendChild(ytScript);
-
-  window.onYouTubeIframeAPIReady = function () { /* ready */ };
+  window.onYouTubeIframeAPIReady = function () {};
 
   function loadYouTubeVideo(videoId, autoplay, startTime) {
     if (ytPlayer && ytPlayer.loadVideoById) {
       ytPlayer.loadVideoById({ videoId, startSeconds: startTime || 0 });
-      if (!autoplay) {
-        setTimeout(() => { if (ytPlayer.pauseVideo) ytPlayer.pauseVideo(); }, 800);
-      }
+      if (!autoplay) setTimeout(() => { if (ytPlayer.pauseVideo) ytPlayer.pauseVideo(); }, 800);
     } else {
       ytPlayer = new YT.Player('yt-player', {
-        videoId: videoId,
-        playerVars: {
-          autoplay: autoplay ? 1 : 0,
-          start: Math.floor(startTime || 0),
-          controls: 0,
-          modestbranding: 1,
-          rel: 0,
-        },
+        videoId,
+        playerVars: { autoplay: autoplay ? 1 : 0, start: Math.floor(startTime || 0), controls: 0, modestbranding: 1, rel: 0 },
         events: {
-          onReady: () => {
-            ytReady = true;
-            ytPlayer.setVolume(volumeSlider.value);
-            if (!autoplay) ytPlayer.pauseVideo();
-            startYTProgress();
-          },
+          onReady: () => { ytReady = true; ytPlayer.setVolume(volumeSlider.value); if (!autoplay) ytPlayer.pauseVideo(); startYTProgress(); },
           onStateChange: (e) => {
             if (e.data === YT.PlayerState.PLAYING) setPlayingUI(true);
             if (e.data === YT.PlayerState.PAUSED) setPlayingUI(false);
-            if (e.data === YT.PlayerState.ENDED) setPlayingUI(false);
+            if (e.data === YT.PlayerState.ENDED) { setPlayingUI(false); if (socket) socket.emit('track-ended'); }
           }
         }
       });
@@ -517,9 +544,8 @@
       if (!ytPlayer || !ytReady || isSeeking) return;
       const cur = ytPlayer.getCurrentTime() || 0;
       const dur = ytPlayer.getDuration() || 1;
-      const pct = (cur / dur) * 100;
-      seekFill.style.width = pct + '%';
-      seekThumb.style.left = pct + '%';
+      seekFill.style.width = ((cur / dur) * 100) + '%';
+      seekThumb.style.left = ((cur / dur) * 100) + '%';
       timeCurrent.textContent = formatTime(cur);
       timeTotal.textContent = formatTime(dur);
     }, 400);
@@ -529,113 +555,71 @@
     const url = ytUrlInput.value.trim();
     if (!url) return;
     const videoId = extractYouTubeId(url);
-    if (!videoId) {
-      alert('Invalid YouTube URL');
-      return;
-    }
+    if (!videoId) { alert('Invalid YouTube URL'); return; }
     socket.emit('play-youtube', { videoId, title: 'YouTube Video' });
     ytUrlInput.value = '';
   });
-
-  ytUrlInput.addEventListener('keydown', e => {
-    if (e.key === 'Enter') ytPlayBtn.click();
-  });
+  ytUrlInput.addEventListener('keydown', e => { if (e.key === 'Enter') ytPlayBtn.click(); });
 
   // ─── File Upload ──────────────────────
-  browseBtn.addEventListener('click', (e) => {
-    e.preventDefault();
-    fileInput.click();
-  });
-
-  uploadArea.addEventListener('click', (e) => {
-    if (e.target !== browseBtn) fileInput.click();
-  });
-
-  uploadArea.addEventListener('dragover', (e) => {
-    e.preventDefault();
-    uploadArea.classList.add('dragover');
-  });
-
-  uploadArea.addEventListener('dragleave', () => {
-    uploadArea.classList.remove('dragover');
-  });
-
+  browseBtn.addEventListener('click', (e) => { e.preventDefault(); fileInput.click(); });
+  uploadArea.addEventListener('click', (e) => { if (e.target !== browseBtn) fileInput.click(); });
+  uploadArea.addEventListener('dragover', (e) => { e.preventDefault(); uploadArea.classList.add('dragover'); });
+  uploadArea.addEventListener('dragleave', () => { uploadArea.classList.remove('dragover'); });
   uploadArea.addEventListener('drop', (e) => {
-    e.preventDefault();
-    uploadArea.classList.remove('dragover');
+    e.preventDefault(); uploadArea.classList.remove('dragover');
     if (e.dataTransfer.files.length > 0) uploadFile(e.dataTransfer.files[0]);
   });
-
   fileInput.addEventListener('change', () => {
-    if (fileInput.files.length > 0) {
-      uploadFile(fileInput.files[0]);
-      fileInput.value = '';
-    }
+    if (fileInput.files.length > 0) { uploadFile(fileInput.files[0]); fileInput.value = ''; }
   });
 
   function uploadFile(file) {
     const formData = new FormData();
     formData.append('music', file);
-
     uploadProgress.classList.remove('hidden');
     progressFill.style.width = '0%';
     uploadStatus.textContent = `Uploading ${file.name}…`;
 
     const xhr = new XMLHttpRequest();
     xhr.open('POST', '/upload');
-
     xhr.upload.addEventListener('progress', (e) => {
-      if (e.lengthComputable) {
-        progressFill.style.width = ((e.loaded / e.total) * 100) + '%';
-      }
+      if (e.lengthComputable) progressFill.style.width = ((e.loaded / e.total) * 100) + '%';
     });
-
     xhr.addEventListener('load', () => {
       if (xhr.status === 200) {
         const resp = JSON.parse(xhr.responseText);
         uploadStatus.textContent = `✓ ${resp.file.originalName}`;
         progressFill.style.width = '100%';
-        setTimeout(() => { uploadProgress.classList.add('hidden'); }, 2000);
+        setTimeout(() => uploadProgress.classList.add('hidden'), 2000);
         loadFileList();
-      } else {
-        uploadStatus.textContent = 'Upload failed!';
-      }
+      } else { uploadStatus.textContent = 'Upload failed!'; }
     });
-
     xhr.addEventListener('error', () => { uploadStatus.textContent = 'Upload error!'; });
     xhr.send(formData);
   }
 
   // ─── File List ────────────────────────
   function loadFileList() {
-    fetch('/api/files')
-      .then(r => r.json())
-      .then(files => {
-        musicFiles = files;
-        renderFileList();
-      });
+    fetch('/api/files').then(r => r.json()).then(files => { musicFiles = files; renderFileList(); });
   }
 
   function renderFileList() {
     fileListEl.innerHTML = '';
-    if (musicFiles.length === 0) {
-      fileListEl.innerHTML = '<li class="empty-state">No files uploaded yet</li>';
-      return;
-    }
-    musicFiles.forEach((f, i) => {
+    if (musicFiles.length === 0) { fileListEl.innerHTML = '<li class="empty-state">No files uploaded yet</li>'; return; }
+    musicFiles.forEach((f) => {
       const li = document.createElement('li');
       li.className = 'file-item';
       li.dataset.url = f.url;
       li.innerHTML = `
         <div class="file-icon">🎵</div>
         <div class="file-info">
-          <div class="file-name">${f.originalName || f.filename}</div>
+          <div class="file-name">${escapeHtml(f.originalName || f.filename)}</div>
           <div class="file-size">${formatFileSize(f.size)}</div>
         </div>
         <span class="file-play-icon">▶</span>
       `;
       li.addEventListener('click', () => {
-        currentFileIndex = i;
         socket.emit('play-file', { url: f.url, name: f.originalName || f.filename });
       });
       fileListEl.appendChild(li);
@@ -646,7 +630,6 @@
     document.querySelectorAll('.file-item').forEach(el => el.classList.remove('active'));
     const match = document.querySelector(`.file-item[data-url="${url}"]`);
     if (match) match.classList.add('active');
-    currentFileIndex = musicFiles.findIndex(f => f.url === url);
   }
 
   // ─── Chat ─────────────────────────────
@@ -676,10 +659,80 @@
     chatMessages.scrollTop = chatMessages.scrollHeight;
   }
 
-  function escapeHtml(str) {
-    const div = document.createElement('div');
-    div.textContent = str;
-    return div.innerHTML;
-  }
+  // ─── Keyboard Shortcuts ───────────────
+  let shortcutsVisible = false;
+
+  document.addEventListener('keydown', (e) => {
+    // Don't intercept when typing in inputs
+    if (['INPUT', 'TEXTAREA'].includes(e.target.tagName)) return;
+    if (!appScreen.classList.contains('active')) return;
+
+    switch (e.key) {
+      case ' ':
+        e.preventDefault();
+        togglePlayPause();
+        break;
+      case 'ArrowRight':
+        e.preventDefault();
+        if (e.shiftKey) {
+          if (socket) socket.emit('queue-next');
+        } else {
+          // Seek forward 5s
+          if (currentType === 'file') {
+            const t = Math.min(audioPlayer.currentTime + 5, audioPlayer.duration || 0);
+            audioPlayer.currentTime = t;
+            socket.emit('transport', { action: 'seek', currentTime: t });
+          } else if (currentType === 'youtube' && ytPlayer && ytReady) {
+            const t = Math.min(ytPlayer.getCurrentTime() + 5, ytPlayer.getDuration());
+            ytPlayer.seekTo(t, true);
+            socket.emit('transport', { action: 'seek', currentTime: t });
+          }
+        }
+        break;
+      case 'ArrowLeft':
+        e.preventDefault();
+        if (e.shiftKey) {
+          if (socket) socket.emit('queue-prev');
+        } else {
+          // Seek back 5s
+          if (currentType === 'file') {
+            const t = Math.max(audioPlayer.currentTime - 5, 0);
+            audioPlayer.currentTime = t;
+            socket.emit('transport', { action: 'seek', currentTime: t });
+          } else if (currentType === 'youtube' && ytPlayer && ytReady) {
+            const t = Math.max(ytPlayer.getCurrentTime() - 5, 0);
+            ytPlayer.seekTo(t, true);
+            socket.emit('transport', { action: 'seek', currentTime: t });
+          }
+        }
+        break;
+      case 'ArrowUp':
+        e.preventDefault();
+        volumeSlider.value = Math.min(parseInt(volumeSlider.value) + 5, 100);
+        volumeSlider.dispatchEvent(new Event('input'));
+        break;
+      case 'ArrowDown':
+        e.preventDefault();
+        volumeSlider.value = Math.max(parseInt(volumeSlider.value) - 5, 0);
+        volumeSlider.dispatchEvent(new Event('input'));
+        break;
+      case 'm':
+      case 'M':
+        e.preventDefault();
+        if (parseInt(volumeSlider.value) > 0) {
+          prevVolume = volumeSlider.value;
+          volumeSlider.value = 0;
+        } else {
+          volumeSlider.value = prevVolume || 80;
+        }
+        volumeSlider.dispatchEvent(new Event('input'));
+        break;
+      case '?':
+        e.preventDefault();
+        shortcutsVisible = !shortcutsVisible;
+        shortcutsTip.style.display = shortcutsVisible ? 'block' : 'none';
+        break;
+    }
+  });
 
 })();
